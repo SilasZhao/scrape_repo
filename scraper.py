@@ -297,29 +297,25 @@ def process_single_category_with_prefix(client: ApifyClient, args, category: str
 
     # Stream items, normalize, and buffer for CSV
     normalized = []
-    raw_jsonl_path = f"{prefix}.jsonl"
     csv_path = f"{prefix}.csv"
 
-    # First pass: write JSONL while collecting normalized rows
+    # Fetch and normalize all items
     print(f"Fetching results for {category}...")
     fetched = 0
-    with open(raw_jsonl_path, "w", encoding="utf-8") as jf:
-        for item in iter_results(client, dataset_id):
-            jf.write(json.dumps(item, ensure_ascii=False) + "\n")
-            normalized.append(normalize_record(item))
-            fetched += 1
-            if fetched % 100 == 0:
-                print(f"  ... {fetched} items")
-                # Save intermediate CSV every 100 items
-                print(f"  ... saving intermediate results to {csv_path}")
-                save_csv(csv_path, normalized)
+    for item in iter_results(client, dataset_id):
+        normalized.append(normalize_record(item))
+        fetched += 1
+        if fetched % 100 == 0:
+            print(f"  ... {fetched} items")
+            # Save intermediate CSV every 100 items
+            print(f"  ... saving intermediate results to {csv_path}")
+            save_csv(csv_path, normalized)
 
     # Save final CSV with updated filename that includes line count
     final_csv_path = f"{prefix}_{fetched}_lines.csv"
     save_csv(final_csv_path, normalized)
 
     print(f"Done. Items fetched for {category}: {fetched}")
-    print(f"JSONL: {raw_jsonl_path}")
     print(f"CSV  : {final_csv_path}")
 
 
