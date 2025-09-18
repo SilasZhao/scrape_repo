@@ -1,25 +1,46 @@
 #!/usr/bin/env python3
 """
-Scrape Yellow Pages via Apify and export all results.
+Scrape Yellow Pages via Apify and export all results with multi-threading support.
 
 Single Category Usage:
   python scraper.py --category "Plumber" --location "NC" -o Plumber_NC_YellowPage --max-items 260
-  python scraper.py -c "Dentist" -l "CA" -o dentists_ca --max-items 0
-  python scraper.py -c "Restaurant" -l "tx" --max-items 50
+  python scraper.py -c "Dentist" -l "Charlotte, NC" -o dentists_charlotte --max-items 100
+  python scraper.py -c "Restaurant" -l "Los Angeles, CA" --max-items 50
 
 Batch Processing Usage:
-  python scraper.py --batch-file input1.txt --location "NC" --max-items 100
-  python scraper.py --batch-file input1.txt --location "CA" --output-dir "california_scrape"
+  # Single location, multiple categories (multi-threaded)
+  python scraper.py --batch-file categories.txt --location "Charlotte, NC" --max-items 100 --max-threads 4
 
-  Where input1.txt contains one category per line, e.g.:
+  # Multiple locations and categories (cross-product, multi-threaded)
+  python scraper.py --batch-categories categories.txt --batch-locations locations.txt --max-items 50 --max-threads 8
+
+  Where categories.txt contains one category per line:
     Plumber
     Electrician
     HVAC Contractor
     General Contractor
 
+  And locations.txt contains one location per line:
+    Charlotte, NC
+    Raleigh, NC
+    Durham, NC
+    Greensboro, NC
+
+Location Examples:
+  - "NC" (state only)
+  - "Charlotte, NC" (city and state)
+  - "Los Angeles, CA"
+  - "Austin, TX"
+  - "Miami, FL"
+
+Multi-threading:
+  - Use --max-threads to control parallelism (default: 4)
+  - Higher thread counts speed up batch processing
+  - Each thread creates its own Apify client for thread safety
+
 APIFY_TOKEN is read from the APIFY_TOKEN env var or --token.
-Location must be a valid U.S. state abbreviation (e.g., NC, CA, TX, FL).
 --max-items set to 0 means no limit (default: 30).
+Output: Only CSV files are generated (no JSON).
 """
 
 import argparse
@@ -27,8 +48,11 @@ import csv
 import json
 import os
 import sys
+import re
 from datetime import datetime
 from typing import Dict, Any, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from apify_client import ApifyClient
 
@@ -45,6 +69,69 @@ US_STATES = {
     'DC'  # Washington D.C.
 }
 
+
+def parse_location(location: str) -> Dict[str, str]:
+    """Parse location string into city, state, and optional zip code components."""
+    # Clean up the location string
+    location = location.strip()
+
+    # Support different formats:
+    # "Charlotte, NC"
+    # "Charlotte, NC 28202"
+    # "Los Angeles, CA"
+    # "NC" (state only - backwards compatibility)
+
+    if ',' in location:
+        # City, State [optional zip] format
+        parts = [part.strip() for part in location.split(',')]
+        if len(parts) == 2:
+            city = parts[0]
+            state_part = parts[1].strip()
+
+            # Check if the state part contains a zip code
+            # Pattern: "NC 28202" or "CA 90210"
+            zip_pattern = re.compile(r'^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$', re.IGNORECASE)
+            zip_match = zip_pattern.match(state_part)
+
+            if zip_match:
+                # Found zip code
+                state = zip_match.group(1).upper()
+                zip_code = zip_match.group(2)
+                full_location = f"{city}, {state} {zip_code}"
+                safe_name = f"{city.lower().replace(' ', '_')}_{state.lower()}_{zip_code}"
+            else:
+                # No zip code, just state
+                state = state_part.upper()
+                zip_code = ''
+                full_location = f"{city}, {state}"
+                safe_name = f"{city.lower().replace(' ', '_')}_{state.lower()}"
+
+            # Validate state abbreviation
+            if state not in US_STATES:
+                raise ValueError(f"Invalid state abbreviation: '{state}'. Must be one of: {', '.join(sorted(US_STATES))}")
+
+            return {
+                'city': city,
+                'state': state,
+                'zip_code': zip_code,
+                'full_location': full_location,
+                'safe_name': safe_name
+            }
+        else:
+            raise ValueError(f"Invalid location format: '{location}'. Use 'City, State' or 'City, State Zip' format (e.g., 'Charlotte, NC' or 'Charlotte, NC 28202')")
+    else:
+        # State only (backwards compatibility)
+        state_upper = location.upper()
+        if state_upper not in US_STATES:
+            raise ValueError(f"Invalid state abbreviation: '{location}'. Must be one of: {', '.join(sorted(US_STATES))}")
+
+        return {
+            'city': '',
+            'state': state_upper,
+            'zip_code': '',
+            'full_location': state_upper,
+            'safe_name': state_upper.lower()
+        }
 
 
 def run_yellow_pages_actor(
@@ -123,15 +210,6 @@ def normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def save_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> int:
-    count = 0
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            count += 1
-    return count
-
-
 def save_csv(path: str, rows: Iterable[Dict[str, Any]]) -> int:
     rows = list(rows)
     if not rows:
@@ -172,8 +250,12 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-c", "--category", help='Business category, e.g., "Plumber"')
     group.add_argument("--batch-file", help='File containing list of categories to scrape (one per line)')
+    group.add_argument("--batch-categories", help='File containing list of categories (for cross-product with --batch-locations)')
 
-    parser.add_argument("-l", "--location", required=True, help='U.S. state abbreviation, e.g., "NC", "CA", "TX"')
+    parser.add_argument("--batch-locations", help='File containing list of locations (used with --batch-categories for cross-product processing)')
+
+    parser.add_argument("-l", "--location", required=False,
+                       help='Location as "City, State" (e.g., "Charlotte, NC"), "City, State Zip" (e.g., "Charlotte, NC 28202"), or just state abbreviation (e.g., "NC"). Required for single category or --batch-file mode.')
     parser.add_argument("-o", "--output-prefix", default=None, help="Output file prefix (default: yelp_<category>_<location>_<date>)")
     parser.add_argument("--output-dir", default=None, help="Output directory for batch processing (default: creates timestamped directory)")
     parser.add_argument("--debug", action="store_true", help="Enable actor debug mode.")
@@ -184,18 +266,36 @@ def main():
         default=30,  # <-- default changed to 30
         help="Maximum items to fetch (0 for unlimited, default: 30).",
     )
+    parser.add_argument(
+        "--max-threads",
+        type=int,
+        default=4,
+        help="Maximum number of threads for batch processing (default: 4).",
+    )
     args = parser.parse_args()
-    
-    # Validate location is a U.S. state abbreviation
-    location_upper = args.location.upper().strip()
-    if location_upper not in US_STATES:
-        print(f"ERROR: Location must be a valid U.S. state abbreviation. Got: '{args.location}'", file=sys.stderr)
-        print(f"Valid options: {', '.join(sorted(US_STATES))}", file=sys.stderr)
+
+    # Validate argument combinations
+    if args.batch_categories and not args.batch_locations:
+        print("ERROR: --batch-categories requires --batch-locations", file=sys.stderr)
         sys.exit(1)
+    if args.batch_locations and not args.batch_categories:
+        print("ERROR: --batch-locations requires --batch-categories", file=sys.stderr)
+        sys.exit(1)
+    if (args.category or args.batch_file) and not args.location:
+        print("ERROR: --location is required for single category or --batch-file mode", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse and validate location (only for non-cross-product modes)
+    location_info = None
+    if args.location:
+        try:
+            location_info = parse_location(args.location)
+            print(f"Scraping location: {location_info['full_location']}")
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
     
-    # Use the uppercase version
-    args.location = location_upper
-    
+
     token = args.token or os.getenv("APIFY_TOKEN")
     if not token:
         print("ERROR: Provide Apify token via --token or APIFY_TOKEN environment variable.", file=sys.stderr)
@@ -203,18 +303,144 @@ def main():
 
     client = ApifyClient(token)
 
-    # Handle batch processing vs single category
-    if args.batch_file:
-        process_batch(client, args)
+    # Handle different processing modes
+    if args.batch_categories and args.batch_locations:
+        process_cross_product_batch(client, args)
+    elif args.batch_file:
+        process_batch(client, args, location_info)
     else:
-        process_single_category(client, args, args.category)
+        process_single_category(client, args, args.category, location_info)
 
 
-def process_batch(client: ApifyClient, args):
-    """Process multiple categories from a batch file."""
+def process_single_job(args, category: str, location_info: Dict[str, str], output_dir: str, job_num: int, total_jobs: int, token: str) -> Dict[str, Any]:
+    """Process a single category-location combination in a thread-safe manner."""
+    # Create a new client for this thread to avoid sharing issues
+    client = ApifyClient(token)
+
+    try:
+        # Create combination-specific output paths
+        safe_cat = category.strip().lower().replace(" ", "_")
+        safe_loc = location_info['safe_name']
+        date_tag = datetime.now().strftime("%Y%m%d")
+        prefix = os.path.join(output_dir, f"yellowpages_{safe_cat}_{safe_loc}_{date_tag}")
+
+        # Thread-safe printing with lock
+        with threading.Lock():
+            print(f"[{job_num}/{total_jobs}] Processing: {category} in {location_info['full_location']}")
+
+        # Process single category-location combination
+        process_single_category_with_prefix(client, args, category, location_info, prefix)
+
+        return {
+            'success': True,
+            'category': category,
+            'location': location_info['full_location'],
+            'job_num': job_num
+        }
+
+    except Exception as e:
+        return {
+            'success': False,
+            'category': category,
+            'location': location_info['full_location'],
+            'error': str(e),
+            'job_num': job_num
+        }
+
+
+def process_cross_product_batch(_: ApifyClient, args):
+    """Process cross-product of categories and locations from separate files using multi-threading."""
+    # Read categories from file
+    try:
+        with open(args.batch_categories, 'r', encoding='utf-8') as f:
+            categories = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Error reading categories file {args.batch_categories}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Read locations from file
+    try:
+        with open(args.batch_locations, 'r', encoding='utf-8') as f:
+            locations = [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Error reading locations file {args.batch_locations}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not categories:
+        print("No categories found in categories file.", file=sys.stderr)
+        sys.exit(1)
+    if not locations:
+        print("No locations found in locations file.", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate all locations before starting
+    parsed_locations = []
+    for location in locations:
+        try:
+            location_info = parse_location(location)
+            parsed_locations.append(location_info)
+        except ValueError as e:
+            print(f"ERROR: Invalid location '{location}': {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Create output directory
     date_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_loc = args.location.strip().lower().replace(" ", "_").replace(",", "")
+    output_dir = args.output_dir or f"cross_product_scrape_{date_tag}"
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+
+    # Create job list for all combinations
+    jobs = []
+    job_num = 0
+    for category in categories:
+        for location_info in parsed_locations:
+            job_num += 1
+            jobs.append((category, location_info, job_num))
+
+    total_jobs = len(jobs)
+    print(f"Processing {len(categories)} categories × {len(parsed_locations)} locations = {total_jobs} combinations")
+    print(f"Using {args.max_threads} threads")
+    print(f"Output directory: {output_dir}")
+
+    successful = 0
+    failed = 0
+
+    # Get token for thread workers
+    token = args.token or os.getenv("APIFY_TOKEN")
+
+    # Process jobs using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=args.max_threads) as executor:
+        # Submit all jobs
+        future_to_job = {
+            executor.submit(process_single_job, args, category, location_info, output_dir, job_num, total_jobs, token):
+            (category, location_info, job_num)
+            for category, location_info, job_num in jobs
+        }
+
+        # Process completed jobs
+        for future in as_completed(future_to_job):
+            result = future.result()
+
+            if result['success']:
+                successful += 1
+                print(f"✓ [{result['job_num']}/{total_jobs}] Successfully processed: {result['category']} in {result['location']}")
+            else:
+                failed += 1
+                print(f"✗ [{result['job_num']}/{total_jobs}] Failed to process {result['category']} in {result['location']}: {result['error']}", file=sys.stderr)
+
+    print(f"\n=== Cross-product batch processing complete ===")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"Output directory: {output_dir}")
+
+
+def process_batch(_: ApifyClient, args, location_info: Dict[str, str]):
+    """Process multiple categories from a batch file using multi-threading."""
+    # Create output directory
+    date_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_loc = location_info['safe_name']
     output_dir = args.output_dir or f"batch_scrape_{safe_loc}_{date_tag}"
 
     if not os.path.exists(output_dir):
@@ -234,30 +460,34 @@ def process_batch(client: ApifyClient, args):
         sys.exit(1)
 
     print(f"Processing {len(categories)} categories from {args.batch_file}")
+    print(f"Using {args.max_threads} threads")
     print(f"Output directory: {output_dir}")
 
     successful = 0
     failed = 0
 
-    for i, category in enumerate(categories, 1):
-        print(f"\n=== Processing category {i}/{len(categories)}: {category} ===")
+    # Get token for thread workers
+    token = args.token or os.getenv("APIFY_TOKEN")
 
-        try:
-            # Create category-specific output paths
-            safe_cat = category.strip().lower().replace(" ", "_")
-            safe_loc = args.location.strip().lower().replace(" ", "_").replace(",", "")
-            date_tag = datetime.now().strftime("%Y%m%d")
-            prefix = os.path.join(output_dir, f"yellowpages_{safe_cat}_{safe_loc}_{date_tag}")
+    # Process categories using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=args.max_threads) as executor:
+        # Submit all jobs
+        future_to_job = {
+            executor.submit(process_single_job, args, category, location_info, output_dir, i, len(categories), token):
+            (category, i)
+            for i, category in enumerate(categories, 1)
+        }
 
-            # Process single category with custom prefix
-            process_single_category_with_prefix(client, args, category, prefix)
-            successful += 1
-            print(f"✓ Successfully processed: {category}")
+        # Process completed jobs
+        for future in as_completed(future_to_job):
+            result = future.result()
 
-        except Exception as e:
-            failed += 1
-            print(f"✗ Failed to process {category}: {e}", file=sys.stderr)
-            continue
+            if result['success']:
+                successful += 1
+                print(f"✓ [{result['job_num']}/{len(categories)}] Successfully processed: {result['category']}")
+            else:
+                failed += 1
+                print(f"✗ [{result['job_num']}/{len(categories)}] Failed to process {result['category']}: {result['error']}", file=sys.stderr)
 
     print(f"\n=== Batch processing complete ===")
     print(f"Successful: {successful}")
@@ -265,24 +495,24 @@ def process_batch(client: ApifyClient, args):
     print(f"Output directory: {output_dir}")
 
 
-def process_single_category(client: ApifyClient, args, category: str):
+def process_single_category(client: ApifyClient, args, category: str, location_info: Dict[str, str]):
     """Process a single category with default output naming."""
     # Build output names
     safe_cat = category.strip().lower().replace(" ", "_")
-    safe_loc = args.location.strip().lower().replace(" ", "_").replace(",", "")
+    safe_loc = location_info['safe_name']
     date_tag = datetime.now().strftime("%Y%m%d")
     prefix = args.output_prefix or f"yellowpages_{safe_cat}_{safe_loc}_{date_tag}"
 
-    process_single_category_with_prefix(client, args, category, prefix)
+    process_single_category_with_prefix(client, args, category, location_info, prefix)
 
 
-def process_single_category_with_prefix(client: ApifyClient, args, category: str, prefix: str):
+def process_single_category_with_prefix(client: ApifyClient, args, category: str, location_info: Dict[str, str], prefix: str):
     """Process a single category with a specific output prefix."""
     try:
         run = run_yellow_pages_actor(
             client=client,
             category=category,
-            location=args.location,
+            location=location_info['full_location'],  # Use full "City, State" or "State" format
             max_items=args.max_items,
             debug=args.debug,
         )
@@ -300,7 +530,7 @@ def process_single_category_with_prefix(client: ApifyClient, args, category: str
     csv_path = f"{prefix}.csv"
 
     # Fetch and normalize all items
-    print(f"Fetching results for {category}...")
+    print(f"Fetching results for {category} in {location_info['full_location']}...")
     fetched = 0
     for item in iter_results(client, dataset_id):
         normalized.append(normalize_record(item))
@@ -315,7 +545,7 @@ def process_single_category_with_prefix(client: ApifyClient, args, category: str
     final_csv_path = f"{prefix}_{fetched}_lines.csv"
     save_csv(final_csv_path, normalized)
 
-    print(f"Done. Items fetched for {category}: {fetched}")
+    print(f"Done. Items fetched for {category} in {location_info['full_location']}: {fetched}")
     print(f"CSV  : {final_csv_path}")
 
 
